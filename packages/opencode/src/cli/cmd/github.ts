@@ -218,7 +218,7 @@ export const GithubInstallCommand = cmd({
               openai: 2,
               google: 3,
             }
-            let provider = await prompts.select({
+            let provider = await prompts.autocomplete({
               message: "Select provider",
               maxItems: 8,
               options: pipe(
