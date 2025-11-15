@@ -36,6 +36,49 @@ This directory contains comprehensive OAuth implementation specifications for va
   - API key fallback for simpler setup
   - Both auth methods in single flow
 
+### 4. [OpenAI OAuth](./oauth-openai.md)
+- **Provider**: OpenAI Platform
+- **OAuth Flow**: PKCE (Proof Key for Code Exchange)
+- **Key Features**:
+  - Dual authentication (OAuth + API key)
+  - Enterprise SSO support
+  - Manual authorization code entry
+  - Token refresh with 5-minute buffer
+  - API key as primary fallback option
+
+### 5. [Google OAuth](./oauth-google.md)
+- **Provider**: Google (Vertex AI / Gemini)
+- **OAuth Flow**: OAuth 2.0 with PKCE + Local Callback Server
+- **Key Features**:
+  - Local HTTP server for automatic code capture
+  - No manual code copying required
+  - Offline access for refresh tokens
+  - Google Cloud Platform integration
+  - Project and location configuration
+  - Long-lived refresh tokens
+
+### 6. [Azure OpenAI OAuth](./oauth-azure.md)
+- **Provider**: Azure OpenAI Service
+- **OAuth Flow**: Microsoft Identity Platform with PKCE
+- **Key Features**:
+  - Microsoft Entra ID (Azure AD) integration
+  - Enterprise SSO and MFA support
+  - Local callback server
+  - Azure resource name configuration
+  - Multi-tenant support
+  - 90-day refresh token validity
+
+### 7. [Hugging Face OAuth](./oauth-huggingface.md)
+- **Provider**: Hugging Face Inference API
+- **OAuth Flow**: OAuth 2.0 with PKCE + Local Callback Server
+- **Key Features**:
+  - Dual authentication (OAuth + user access tokens)
+  - Local callback server for automatic code capture
+  - Fine-grained permission scopes
+  - User access tokens as simpler alternative
+  - No expiration for user tokens
+  - Inference API access
+
 ## Specification Structure
 
 Each OAuth specification document includes:
@@ -85,17 +128,19 @@ Complete step-by-step checklist for implementing each provider:
 
 ## OAuth Flow Comparison
 
-| Feature | Anthropic | GitHub Copilot | OpenCode Zen |
-|---------|-----------|----------------|--------------|
-| **Flow Type** | PKCE | Device Authorization | PKCE |
-| **Code Entry** | Manual paste | User code in browser | Manual paste |
-| **Token Refresh** | Yes (5 min buffer) | No (re-auth) | Yes (5 min buffer) |
-| **Refresh Token** | Yes | No | Yes |
-| **Admin Only** | Yes | Yes | No |
-| **API Key Fallback** | Yes | Yes | Yes (primary option) |
-| **Token Validity** | ~1 hour | ~8 hours | ~1 hour |
-| **Polling Required** | No | Yes | No |
-| **Browser Opening** | Automatic | Automatic | Automatic |
+| Feature | Anthropic | GitHub Copilot | OpenCode Zen | OpenAI | Google | Azure | Hugging Face |
+|---------|-----------|----------------|--------------|--------|--------|-------|--------------|
+| **Flow Type** | PKCE | Device Authorization | PKCE | PKCE | PKCE + Local Server | Microsoft Identity + PKCE | PKCE + Local Server |
+| **Code Entry** | Manual paste | User code in browser | Manual paste | Manual paste | Automatic (local server) | Automatic (local server) | Automatic (local server) |
+| **Token Refresh** | Yes (5 min buffer) | No (re-auth) | Yes (5 min buffer) | Yes (5 min buffer) | Yes (5 min buffer) | Yes (5 min buffer) | Yes (5 min buffer) |
+| **Refresh Token** | Yes | No | Yes | Yes | Yes (long-lived) | Yes (90 days) | Yes |
+| **Admin Only** | Yes | Yes | No | No | No | No | No |
+| **API Key Fallback** | Yes | Yes | Yes (primary) | Yes (primary) | No | No | Yes (user tokens) |
+| **Token Validity** | ~1 hour | ~8 hours | ~1 hour | ~1 hour | ~1 hour | ~1 hour | ~1 hour |
+| **Polling Required** | No | Yes | No | No | No | No | No |
+| **Browser Opening** | Automatic | Automatic | Automatic | Automatic | Automatic | Automatic | Automatic |
+| **Local Server** | No | No | No | No | Yes | Yes | Yes |
+| **SSO Support** | No | No | No | No | No | Yes (Entra ID) | No |
 
 ## Common Patterns
 
@@ -162,7 +207,11 @@ Recommended order for implementing OAuth providers:
 
 1. **Start with Anthropic** - Standard PKCE flow, good reference implementation
 2. **Then OpenCode Zen** - Adds API key fallback pattern
-3. **Finally GitHub Copilot** - More complex device flow with polling
+3. **Then OpenAI** - Similar to OpenCode Zen, widely used
+4. **Then Hugging Face** - Introduces local server + user token options
+5. **Then Google** - Google Cloud Platform integration patterns
+6. **Then Azure** - Microsoft Identity Platform, enterprise SSO
+7. **Finally GitHub Copilot** - More complex device flow with polling
 
 ## Adding New Provider Specifications
 
