@@ -216,33 +216,279 @@ export interface Plugin {
 
 The plugin is distributed as `opencode-copilot-auth@0.0.5` on npm and automatically loaded by opencode.
 
-**Package Location:**
-```
-~/.bun/install/cache/opencode-copilot-auth@0.0.5/
-```
+**Package Information:**
+- Package: `opencode-copilot-auth`
+- Version: `0.0.5`
+- Weekly Downloads: ~55,000
+- Location: `~/.bun/install/cache/opencode-copilot-auth@0.0.5/`
+- NPM: https://www.npmjs.com/package/opencode-copilot-auth
 
-**Plugin Entry Point (`index.mjs`):**
+**Complete Plugin Source Code (`index.mjs`):**
 
 ```javascript
+/**
+ * @type {import('@opencode-ai/plugin').Plugin}
+ */
 export async function CopilotAuthPlugin({ client }) {
+  const CLIENT_ID = "Iv1.b507a08c87ecfe98";
+  const HEADERS = {
+    "User-Agent": "GitHubCopilotChat/0.32.4",
+    "Editor-Version": "vscode/1.105.1",
+    "Editor-Plugin-Version": "copilot-chat/0.32.4",
+    "Copilot-Integration-Id": "vscode-chat",
+  };
+
+  function normalizeDomain(url) {
+    return url.replace(/^https?:\/\//, "").replace(/\/$/, "");
+  }
+
+  function getUrls(domain) {
+    return {
+      DEVICE_CODE_URL: `https://${domain}/login/device/code`,
+      ACCESS_TOKEN_URL: `https://${domain}/login/oauth/access_token`,
+      COPILOT_API_KEY_URL: `https://api.${domain}/copilot_internal/v2/token`,
+    };
+  }
+
   return {
     auth: {
       provider: "github-copilot",
       loader: async (getAuth, provider) => {
-        // Dynamic configuration loader
+        let info = await getAuth();
+        if (!info || info.type !== "oauth") return {};
+
+        if (provider && provider.models) {
+          for (const model of Object.values(provider.models)) {
+            model.cost = {
+              input: 0,
+              output: 0,
+            };
+          }
+        }
+
+        // Set baseURL based on deployment type
+        const enterpriseUrl = info.enterpriseUrl;
+        const baseURL = enterpriseUrl
+          ? `https://copilot-api.${normalizeDomain(enterpriseUrl)}`
+          : "https://api.githubcopilot.com";
+
+        return {
+          baseURL,
+          apiKey: "",
+          async fetch(input, init) {
+            const info = await getAuth();
+            if (info.type !== "oauth") return {};
+            if (!info.access || info.expires < Date.now()) {
+              const domain = info.enterpriseUrl
+                ? normalizeDomain(info.enterpriseUrl)
+                : "github.com";
+              const urls = getUrls(domain);
+
+              const response = await fetch(urls.COPILOT_API_KEY_URL, {
+                headers: {
+                  Accept: "application/json",
+                  Authorization: `Bearer ${info.refresh}`,
+                  ...HEADERS,
+                },
+              });
+
+              if (!response.ok) return;
+
+              const tokenData = await response.json();
+
+              const saveProviderID = info.enterpriseUrl
+                ? "github-copilot-enterprise"
+                : "github-copilot";
+              await client.auth.set({
+                path: {
+                  id: saveProviderID,
+                },
+                body: {
+                  type: "oauth",
+                  refresh: info.refresh,
+                  access: tokenData.token,
+                  expires: tokenData.expires_at * 1000,
+                  ...(info.enterpriseUrl && {
+                    enterpriseUrl: info.enterpriseUrl,
+                  }),
+                },
+              });
+              info.access = tokenData.token;
+            }
+            let isAgentCall = false;
+            let isVisionRequest = false;
+            try {
+              const body =
+                typeof init.body === "string"
+                  ? JSON.parse(init.body)
+                  : init.body;
+              if (body?.messages) {
+                isAgentCall = body.messages.some(
+                  (msg) => msg.role && ["tool", "assistant"].includes(msg.role),
+                );
+                isVisionRequest = body.messages.some(
+                  (msg) =>
+                    Array.isArray(msg.content) &&
+                    msg.content.some((part) => part.type === "image_url"),
+                );
+              }
+            } catch {}
+            const headers = {
+              ...init.headers,
+              ...HEADERS,
+              Authorization: `Bearer ${info.access}`,
+              "Openai-Intent": "conversation-edits",
+              "X-Initiator": isAgentCall ? "agent" : "user",
+            };
+            if (isVisionRequest) {
+              headers["Copilot-Vision-Request"] = "true";
+            }
+            delete headers["x-api-key"];
+            return fetch(input, {
+              ...init,
+              headers,
+            });
+          },
+        };
       },
       methods: [
         {
           type: "oauth",
           label: "Login with GitHub Copilot",
-          prompts: [...],
-          authorize: async (inputs) => {
-            // OAuth flow implementation
-          }
-        }
-      ]
-    }
-  }
+          prompts: [
+            {
+              type: "select",
+              key: "deploymentType",
+              message: "Select GitHub deployment type",
+              options: [
+                {
+                  label: "GitHub.com",
+                  value: "github.com",
+                  hint: "Public",
+                },
+                {
+                  label: "GitHub Enterprise",
+                  value: "enterprise",
+                  hint: "Data residency or self-hosted",
+                },
+              ],
+            },
+            {
+              type: "text",
+              key: "enterpriseUrl",
+              message: "Enter your GitHub Enterprise URL or domain",
+              placeholder: "company.ghe.com or https://company.ghe.com",
+              condition: (inputs) => inputs.deploymentType === "enterprise",
+              validate: (value) => {
+                if (!value) return "URL or domain is required";
+                try {
+                  const url = value.includes("://")
+                    ? new URL(value)
+                    : new URL(`https://${value}`);
+                  if (!url.hostname)
+                    return "Please enter a valid URL or domain";
+                  return undefined;
+                } catch {
+                  return "Please enter a valid URL (e.g., company.ghe.com or https://company.ghe.com)";
+                }
+              },
+            },
+          ],
+          async authorize(inputs = {}) {
+            const deploymentType = inputs.deploymentType || "github.com";
+
+            let domain = "github.com";
+            let actualProvider = "github-copilot";
+
+            if (deploymentType === "enterprise") {
+              const enterpriseUrl = inputs.enterpriseUrl;
+              domain = normalizeDomain(enterpriseUrl);
+              actualProvider = "github-copilot-enterprise";
+            }
+
+            const urls = getUrls(domain);
+
+            const deviceResponse = await fetch(urls.DEVICE_CODE_URL, {
+              method: "POST",
+              headers: {
+                Accept: "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "GitHubCopilotChat/0.35.0",
+              },
+              body: JSON.stringify({
+                client_id: CLIENT_ID,
+                scope: "read:user",
+              }),
+            });
+
+            if (!deviceResponse.ok) {
+              throw new Error("Failed to initiate device authorization");
+            }
+
+            const deviceData = await deviceResponse.json();
+
+            return {
+              url: deviceData.verification_uri,
+              instructions: `Enter code: ${deviceData.user_code}`,
+              method: "auto",
+              callback: async () => {
+                while (true) {
+                  const response = await fetch(urls.ACCESS_TOKEN_URL, {
+                    method: "POST",
+                    headers: {
+                      Accept: "application/json",
+                      "Content-Type": "application/json",
+                      "User-Agent": "GitHubCopilotChat/0.35.0",
+                    },
+                    body: JSON.stringify({
+                      client_id: CLIENT_ID,
+                      device_code: deviceData.device_code,
+                      grant_type:
+                        "urn:ietf:params:oauth:grant-type:device_code",
+                    }),
+                  });
+
+                  if (!response.ok) return { type: "failed" };
+
+                  const data = await response.json();
+
+                  if (data.access_token) {
+                    const result = {
+                      type: "success",
+                      refresh: data.access_token,
+                      access: "",
+                      expires: 0,
+                    };
+
+                    if (actualProvider === "github-copilot-enterprise") {
+                      result.provider = "github-copilot-enterprise";
+                      result.enterpriseUrl = domain;
+                    }
+
+                    return result;
+                  }
+
+                  if (data.error === "authorization_pending") {
+                    await new Promise((resolve) =>
+                      setTimeout(resolve, deviceData.interval * 1000),
+                    );
+                    continue;
+                  }
+
+                  if (data.error) return { type: "failed" };
+
+                  await new Promise((resolve) =>
+                    setTimeout(resolve, deviceData.interval * 1000),
+                  );
+                  continue;
+                }
+              },
+            };
+          },
+        },
+      ],
+    },
+  };
 }
 ```
 
@@ -1296,6 +1542,659 @@ POST https://copilot-api.{enterprise-domain}/v1/chat/completions
 
 ---
 
+## Adapting to Command Code Architecture
+
+This section provides guidance on implementing GitHub Copilot OAuth in Command Code, following the same patterns as the Anthropic Claude OAuth implementation.
+
+### Key Differences: Device Flow vs. PKCE Flow
+
+| Aspect | GitHub Copilot (Device Flow) | Claude Code (PKCE Flow) |
+|--------|------------------------------|-------------------------|
+| **OAuth Grant Type** | Device Authorization Grant (RFC 8628) | Authorization Code with PKCE |
+| **User Experience** | User enters code from CLI into browser | User copies code from browser to CLI |
+| **Code Challenge** | Not used | SHA256 PKCE challenge |
+| **Redirect URI** | Not needed | Required callback URL |
+| **Polling** | CLI polls for authorization | Manual code entry |
+| **Best For** | Terminal-only apps, IoT devices | Apps that can open browsers |
+
+### Implementation Structure
+
+#### 1. Create OAuth Module (`packages/command/src/auth/github-copilot.ts`)
+
+```typescript
+import { Auth } from './index';
+import crypto from 'crypto';
+
+const CLIENT_ID = 'Iv1.b507a08c87ecfe98';
+const DEVICE_CODE_URL = 'https://github.com/login/device/code';
+const ACCESS_TOKEN_URL = 'https://github.com/login/oauth/access_token';
+const COPILOT_TOKEN_URL = 'https://api.github.com/copilot_internal/v2/token';
+
+const HEADERS = {
+  'User-Agent': 'GitHubCopilotChat/0.32.4',
+  'Editor-Version': 'vscode/1.105.1',
+  'Editor-Plugin-Version': 'copilot-chat/0.32.4',
+  'Copilot-Integration-Id': 'vscode-chat',
+};
+
+interface DeviceCodeResponse {
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  expires_in: number;
+  interval: number;
+}
+
+interface TokenResponse {
+  access_token?: string;
+  error?: string;
+}
+
+interface CopilotTokenResponse {
+  token: string;
+  expires_at: number;
+}
+
+/**
+ * Initiate device code flow
+ * Returns device code, user code, and verification URI
+ */
+export async function initiateDeviceFlow(): Promise<DeviceCodeResponse> {
+  const response = await fetch(DEVICE_CODE_URL, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      client_id: CLIENT_ID,
+      scope: 'read:user',
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error('Failed to initiate device authorization');
+  }
+
+  return await response.json();
+}
+
+/**
+ * Poll for access token after user authorizes
+ */
+export async function pollForAccessToken(
+  deviceCode: string,
+  interval: number
+): Promise<string> {
+  while (true) {
+    const response = await fetch(ACCESS_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        client_id: CLIENT_ID,
+        device_code: deviceCode,
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error('Token exchange failed');
+    }
+
+    const data: TokenResponse = await response.json();
+
+    if (data.access_token) {
+      return data.access_token;
+    }
+
+    if (data.error === 'authorization_pending') {
+      // Wait and retry
+      await new Promise(resolve => setTimeout(resolve, interval * 1000));
+      continue;
+    }
+
+    if (data.error === 'expired_token') {
+      throw new Error('Device code expired. Please try again.');
+    }
+
+    if (data.error === 'access_denied') {
+      throw new Error('Authorization was denied.');
+    }
+
+    throw new Error(`Unknown error: ${data.error}`);
+  }
+}
+
+/**
+ * Exchange GitHub OAuth token for Copilot API token
+ */
+async function exchangeForCopilotToken(githubToken: string): Promise<CopilotTokenResponse> {
+  const response = await fetch(COPILOT_TOKEN_URL, {
+    headers: {
+      'Accept': 'application/json',
+      'Authorization': `Bearer ${githubToken}`,
+      ...HEADERS,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error('Failed to get Copilot API token');
+  }
+
+  return await response.json();
+}
+
+/**
+ * Store tokens after successful authentication
+ */
+export async function storeTokens(githubToken: string): Promise<void> {
+  // Get initial Copilot token
+  const copilotToken = await exchangeForCopilotToken(githubToken);
+
+  await Auth.set('github-copilot', {
+    type: 'oauth',
+    refresh: githubToken, // GitHub OAuth token used as refresh token
+    access: copilotToken.token,
+    expires: copilotToken.expires_at * 1000,
+  });
+}
+
+/**
+ * Refresh Copilot API token if expired
+ */
+export async function refreshAccessToken(): Promise<string | undefined> {
+  const auth = await Auth.get('github-copilot');
+  if (!auth || auth.type !== 'oauth') return undefined;
+
+  // Check if token is still valid (with 5-minute buffer)
+  const now = Date.now();
+  const buffer = 5 * 60 * 1000; // 5 minutes
+  if (auth.expires > now + buffer) {
+    return auth.access;
+  }
+
+  try {
+    // Exchange GitHub token for new Copilot token
+    const copilotToken = await exchangeForCopilotToken(auth.refresh);
+
+    // Update stored tokens
+    await Auth.set('github-copilot', {
+      type: 'oauth',
+      refresh: auth.refresh,
+      access: copilotToken.token,
+      expires: copilotToken.expires_at * 1000,
+    });
+
+    return copilotToken.token;
+  } catch (error) {
+    // If refresh fails, remove invalid auth
+    await Auth.remove('github-copilot');
+    return undefined;
+  }
+}
+
+/**
+ * Get valid access token (refresh if needed)
+ */
+export async function getValidAccessToken(): Promise<string | undefined> {
+  const auth = await Auth.get('github-copilot');
+  if (!auth) return undefined;
+
+  if (auth.type === 'api') {
+    // API key stored directly
+    return auth.key;
+  }
+
+  // OAuth token - check and refresh if needed
+  return await refreshAccessToken();
+}
+```
+
+#### 2. Create CLI Command (`packages/command/src/commands/github-copilot-auth.ts`)
+
+```typescript
+import { Command } from 'commander';
+import * as GithubCopilotOAuth from '../auth/github-copilot';
+import { Auth } from '../auth';
+import open from 'open';
+
+export const githubCopilotAuthCommand = new Command('github-copilot-auth')
+  .description('Manage GitHub Copilot authentication');
+
+githubCopilotAuthCommand
+  .command('login')
+  .description('Login to GitHub Copilot')
+  .action(async () => {
+    try {
+      console.log('\n🔐 Starting GitHub Copilot authentication...\n');
+
+      // Initiate device flow
+      const deviceData = await GithubCopilotOAuth.initiateDeviceFlow();
+
+      console.log('Please visit:', deviceData.verification_uri);
+      console.log('Enter code:', deviceData.user_code);
+      console.log('\nOpening browser...');
+
+      // Try to open browser
+      try {
+        await open(deviceData.verification_uri);
+      } catch {
+        console.log('Could not open browser automatically.');
+      }
+
+      console.log('\nWaiting for authorization...');
+
+      // Poll for token
+      const githubToken = await GithubCopilotOAuth.pollForAccessToken(
+        deviceData.device_code,
+        deviceData.interval
+      );
+
+      // Store tokens
+      await GithubCopilotOAuth.storeTokens(githubToken);
+
+      console.log('✅ Successfully authenticated with GitHub Copilot!\n');
+    } catch (error) {
+      console.error('❌ Authentication failed:', error.message);
+      process.exit(1);
+    }
+  });
+
+githubCopilotAuthCommand
+  .command('logout')
+  .description('Logout from GitHub Copilot')
+  .action(async () => {
+    try {
+      const auth = await Auth.get('github-copilot');
+      if (!auth) {
+        console.log('Not currently logged in to GitHub Copilot.');
+        return;
+      }
+
+      await Auth.remove('github-copilot');
+      console.log('✅ Successfully logged out from GitHub Copilot.');
+    } catch (error) {
+      console.error('❌ Logout failed:', error.message);
+      process.exit(1);
+    }
+  });
+
+githubCopilotAuthCommand
+  .command('status')
+  .description('Check GitHub Copilot authentication status')
+  .action(async () => {
+    try {
+      const auth = await Auth.get('github-copilot');
+      if (!auth) {
+        console.log('Status: Not authenticated');
+        return;
+      }
+
+      console.log('Status: Authenticated');
+      console.log('Type:', auth.type);
+
+      if (auth.type === 'oauth') {
+        const now = Date.now();
+        const expiresIn = Math.floor((auth.expires - now) / 1000 / 60);
+        console.log('Token expires in:', expiresIn, 'minutes');
+        console.log('Token valid:', auth.expires > now ? 'Yes' : 'No (needs refresh)');
+      }
+    } catch (error) {
+      console.error('❌ Status check failed:', error.message);
+      process.exit(1);
+    }
+  });
+```
+
+#### 3. Create Interactive UI Component (`packages/command/src/components/github-copilot-auth.tsx`)
+
+```typescript
+import React, { useState, useEffect } from 'react';
+import { Text, Box } from 'ink';
+import Spinner from 'ink-spinner';
+import * as GithubCopilotOAuth from '../auth/github-copilot';
+import open from 'open';
+
+interface Props {
+  onSuccess: () => void;
+  onCancel: () => void;
+}
+
+export const GithubCopilotAuth: React.FC<Props> = ({ onSuccess, onCancel }) => {
+  const [stage, setStage] = useState<'init' | 'waiting' | 'success' | 'error'>('init');
+  const [error, setError] = useState<string>('');
+  const [deviceData, setDeviceData] = useState<any>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const authenticate = async () => {
+      try {
+        // Initiate device flow
+        const data = await GithubCopilotOAuth.initiateDeviceFlow();
+        if (cancelled) return;
+
+        setDeviceData(data);
+
+        // Try to open browser
+        try {
+          await open(data.verification_uri);
+        } catch {
+          // Browser opening failed, user will open manually
+        }
+
+        setStage('waiting');
+
+        // Poll for token
+        const githubToken = await GithubCopilotOAuth.pollForAccessToken(
+          data.device_code,
+          data.interval
+        );
+        if (cancelled) return;
+
+        // Store tokens
+        await GithubCopilotOAuth.storeTokens(githubToken);
+
+        setStage('success');
+        setTimeout(onSuccess, 1000);
+      } catch (err) {
+        if (cancelled) return;
+        setError(err.message);
+        setStage('error');
+      }
+    };
+
+    authenticate();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [onSuccess]);
+
+  if (stage === 'init') {
+    return (
+      <Box flexDirection="column">
+        <Text>
+          <Text color="cyan">
+            <Spinner type="dots" />
+          </Text>
+          {' '}Initializing GitHub Copilot authentication...
+        </Text>
+      </Box>
+    );
+  }
+
+  if (stage === 'waiting' && deviceData) {
+    return (
+      <Box flexDirection="column">
+        <Text bold>GitHub Copilot Authentication</Text>
+        <Text> </Text>
+        <Text>1. Visit: <Text color="cyan">{deviceData.verification_uri}</Text></Text>
+        <Text>2. Enter code: <Text color="green" bold>{deviceData.user_code}</Text></Text>
+        <Text> </Text>
+        <Text>
+          <Text color="cyan">
+            <Spinner type="dots" />
+          </Text>
+          {' '}Waiting for authorization...
+        </Text>
+        <Text> </Text>
+        <Text dimColor>Press ESC to cancel</Text>
+      </Box>
+    );
+  }
+
+  if (stage === 'success') {
+    return (
+      <Box flexDirection="column">
+        <Text color="green">✅ Successfully authenticated with GitHub Copilot!</Text>
+      </Box>
+    );
+  }
+
+  if (stage === 'error') {
+    return (
+      <Box flexDirection="column">
+        <Text color="red">❌ Authentication failed: {error}</Text>
+      </Box>
+    );
+  }
+
+  return null;
+};
+```
+
+#### 4. Integrate with GitHub Copilot Client (`packages/command/src/clients/github-copilot.ts`)
+
+```typescript
+import OpenAI from 'openai';
+import * as GithubCopilotOAuth from '../auth/github-copilot';
+
+export class GithubCopilotClient {
+  private instance: OpenAI | null = null;
+
+  async initialize() {
+    const token = await GithubCopilotOAuth.getValidAccessToken();
+    
+    if (!token) {
+      throw new Error('Not authenticated with GitHub Copilot. Run: cmd github-copilot-auth login');
+    }
+
+    this.instance = new OpenAI({
+      baseURL: 'https://api.githubcopilot.com',
+      apiKey: token,
+      defaultHeaders: {
+        'User-Agent': 'GitHubCopilotChat/0.32.4',
+        'Editor-Version': 'vscode/1.105.1',
+        'Editor-Plugin-Version': 'copilot-chat/0.32.4',
+        'Copilot-Integration-Id': 'vscode-chat',
+      },
+    });
+  }
+
+  async chat(messages: any[], options?: any) {
+    if (!this.instance) {
+      await this.initialize();
+    }
+
+    return await this.instance!.chat.completions.create({
+      model: options?.model || 'gpt-4',
+      messages,
+      ...options,
+    });
+  }
+}
+```
+
+#### 5. Update Provider Configuration (`packages/command/src/utils/provider-config.ts`)
+
+```typescript
+import { GithubCopilotAuth } from '../components/github-copilot-auth';
+import * as GithubCopilotOAuth from '../auth/github-copilot';
+
+export const PROVIDER_CONFIG = {
+  // ... other providers
+  
+  'github-copilot': {
+    name: 'GitHub Copilot',
+    description: 'GitHub Copilot models (free with subscription)',
+    requiresAuth: true,
+    authComponent: GithubCopilotAuth,
+    checkAuth: async () => {
+      const token = await GithubCopilotOAuth.getValidAccessToken();
+      return !!token;
+    },
+  },
+};
+```
+
+### Package Manager Setup (pnpm)
+
+#### Install Dependencies
+
+```bash
+# Install OpenAI SDK for API compatibility
+pnpm add openai
+
+# Install open package for browser launching
+pnpm add open
+
+# Install types
+pnpm add -D @types/node
+```
+
+#### Package Scripts (`package.json`)
+
+```json
+{
+  "scripts": {
+    "auth:github": "pnpm cmd github-copilot-auth",
+    "auth:github:login": "pnpm cmd github-copilot-auth login",
+    "auth:github:logout": "pnpm cmd github-copilot-auth logout",
+    "auth:github:status": "pnpm cmd github-copilot-auth status"
+  }
+}
+```
+
+### Key Differences from OpenCode Implementation
+
+| Aspect | OpenCode | Command Code |
+|--------|----------|--------------|
+| **Plugin System** | External npm plugins | Integrated modules |
+| **Auth Storage** | `~/.opencode/data/auth.json` | `~/.commandcode/models.json` |
+| **Runtime** | Bun | Node.js |
+| **Package Manager** | Bun | pnpm |
+| **UI Framework** | @clack/prompts | Ink (React) |
+| **Command Structure** | Nested subcommands | Flat command structure |
+| **Client Integration** | Provider system with loaders | Direct client classes |
+
+### Enterprise Support
+
+For GitHub Enterprise support, extend the implementation:
+
+```typescript
+// Add enterprise URL prompt in auth component
+const [enterpriseUrl, setEnterpriseUrl] = useState<string>('');
+const [deploymentType, setDeploymentType] = useState<'public' | 'enterprise'>('public');
+
+// Modify URLs based on deployment type
+const getUrls = (domain: string) => ({
+  DEVICE_CODE_URL: `https://${domain}/login/device/code`,
+  ACCESS_TOKEN_URL: `https://${domain}/login/oauth/access_token`,
+  COPILOT_TOKEN_URL: `https://api.${domain}/copilot_internal/v2/token`,
+});
+
+// Store enterprise URL with auth data
+await Auth.set('github-copilot-enterprise', {
+  type: 'oauth',
+  refresh: githubToken,
+  access: copilotToken.token,
+  expires: copilotToken.expires_at * 1000,
+  enterpriseUrl: domain,
+});
+```
+
+### Testing with pnpm
+
+```bash
+# Run auth flow
+pnpm auth:github:login
+
+# Check status
+pnpm auth:github:status
+
+# Test with provider
+pnpm cmd --provider github-copilot "Write a hello world function"
+
+# Logout
+pnpm auth:github:logout
+```
+
+### Complete Implementation Checklist
+
+- [ ] Create `src/auth/github-copilot.ts` with device flow functions
+- [ ] Create `src/commands/github-copilot-auth.ts` with login/logout/status
+- [ ] Create `src/components/github-copilot-auth.tsx` with Ink UI
+- [ ] Create `src/clients/github-copilot.ts` for API calls
+- [ ] Update `src/auth/index.ts` to support OAuth type
+- [ ] Add provider to `src/utils/provider-config.ts`
+- [ ] Install dependencies: `pnpm add openai open`
+- [ ] Add scripts to `package.json`
+- [ ] Test authentication flow
+- [ ] Test token refresh
+- [ ] Test API requests
+- [ ] Add enterprise support (optional)
+- [ ] Update documentation
+
+### Error Handling
+
+```typescript
+// In context-engine.ts or similar
+import * as GithubCopilotOAuth from '../auth/github-copilot';
+
+async function prepareRequest(provider: string) {
+  let token: string | undefined;
+  
+  if (provider === 'github-copilot') {
+    token = await GithubCopilotOAuth.getValidAccessToken();
+    
+    if (!token) {
+      throw new Error(
+        'Not authenticated with GitHub Copilot.\n' +
+        'Run: cmd github-copilot-auth login'
+      );
+    }
+  }
+  
+  return token;
+}
+```
+
+### Comparison with Claude OAuth
+
+| Feature | GitHub Copilot | Claude Code |
+|---------|----------------|-------------|
+| **OAuth Flow** | Device Authorization | Authorization Code + PKCE |
+| **User Action** | Enter code in browser | Copy code from browser |
+| **Code Challenge** | None | SHA256 PKCE |
+| **Polling** | Automatic | Not needed |
+| **Redirect URI** | Not needed | Required |
+| **Token Exchange** | Two-step (GitHub → Copilot) | One-step |
+| **Refresh Logic** | Exchange GitHub token for Copilot token | Use refresh token grant |
+
+### Usage Example
+
+```bash
+# Authenticate
+$ pnpm cmd github-copilot-auth login
+
+🔐 Starting GitHub Copilot authentication...
+
+Please visit: https://github.com/login/device
+Enter code: 8F43-6FCF
+
+Opening browser...
+
+Waiting for authorization...
+
+✅ Successfully authenticated with GitHub Copilot!
+
+# Use with Command Code
+$ pnpm cmd --provider github-copilot "Explain OAuth device flow"
+
+# Check status
+$ pnpm cmd github-copilot-auth status
+Status: Authenticated
+Type: oauth
+Token expires in: 45 minutes
+Token valid: Yes
+```
+
+---
+
 ## Conclusion
 
 This specification document provides a comprehensive guide to implementing GitHub Copilot OAuth authentication in a new repository. The implementation uses industry-standard OAuth 2.0 Device Authorization Grant flow, supports both public and enterprise GitHub deployments, implements automatic token refresh, and provides a secure, user-friendly authentication experience.
@@ -1313,7 +2212,11 @@ By following this specification, you can create a robust, secure, and user-frien
 
 ---
 
-**Document Version:** 1.0  
+**Document Version:** 2.0  
 **Last Updated:** 2025-11-15  
 **Author:** Generated from opencode codebase analysis  
 **License:** Same as opencode project
+
+**Changelog:**
+- v2.0: Added complete plugin source code, Command Code adaptation guide with pnpm support
+- v1.0: Initial comprehensive specification
